@@ -4,7 +4,7 @@ const winston = require('winston');
 const util = require('util');
 
 const user = require('.');
-const db = require('../database');
+const db = require('../database'); // Re-added the db module
 const meta = require('../meta');
 const privileges = require('../privileges');
 const plugins = require('../plugins');
@@ -14,11 +14,47 @@ const sleep = util.promisify(setTimeout);
 
 const Interstitials = module.exports;
 
-// Helper function to validate and send email
-async function validateAndSendEmail(userData, formData, data, hasPassword, isSelf) {
+// Helper function to validate email format and permission
+async function validateEmail(email, allowed, error) {
+	if (!allowed || !utils.isEmailValid(email)) {
+		throw new Error(error);
+	}
+}
+
+// Helper function to check if email change is valid
+async function checkEmailChange(userData, formData, confirmed, current) {
+	if (formData.email === current) {
+		if (confirmed) {
+			throw new Error('[[error:email-nochange]]');
+		}
+		if (!await user.email.canSendValidation(userData.uid, current)) {
+			throw new Error(`[[error:confirm-email-already-sent, ${meta.config.emailConfirmInterval}]]`);
+		}
+	}
+}
+
+// Helper function to send validation email
+async function sendValidationEmail(userData, formData, hasPassword, isPasswordCorrect, isSelf, req) {
+	if (hasPassword && !isPasswordCorrect) {
+		throw new Error('[[error:invalid-password]]');
+	}
+
+	await user.email.sendValidationEmail(userData.uid, {
+		email: formData.email,
+		force: true,
+	}).catch((err) => {
+		winston.error(`[user.interstitials.email] Validation email failed to send\n[emailer.send] ${err.stack}`);
+	});
+	if (isSelf) {
+		req.session.emailChanged = 1;
+	}
+}
+
+// Main function to validate and send email
+async function validateAndSendEmail(userData, formData, req, hasPassword, isSelf) {
 	const [isPasswordCorrect, canEdit, { email: current, 'email:confirmed': confirmed }, { allowed, error }] = await Promise.all([
-		user.isPasswordCorrect(userData.uid, formData.password, data.req.ip),
-		privileges.users.canEdit(data.req.uid, userData.uid),
+		user.isPasswordCorrect(userData.uid, formData.password, req.ip),
+		privileges.users.canEdit(req.uid, userData.uid),
 		user.getUserFields(userData.uid, ['email', 'email:confirmed']),
 		plugins.hooks.fire('filter:user.saveEmail', {
 			uid: userData.uid,
@@ -32,32 +68,11 @@ async function validateAndSendEmail(userData, formData, data, hasPassword, isSel
 	if (!isPasswordCorrect) await sleep(2000);
 
 	if (formData.email && formData.email.length) {
-		if (!allowed || !utils.isEmailValid(formData.email)) {
-			throw new Error(error);
-		}
-
-		if (formData.email === current) {
-			if (confirmed) {
-				throw new Error('[[error:email-nochange]]');
-			} else if (!await user.email.canSendValidation(userData.uid, current)) {
-				throw new Error(`[[error:confirm-email-already-sent, ${meta.config.emailConfirmInterval}]]`);
-			}
-		}
+		await validateEmail(formData.email, allowed, error);
+		await checkEmailChange(userData, formData, confirmed, current);
 
 		if (canEdit) {
-			if (hasPassword && !isPasswordCorrect) {
-				throw new Error('[[error:invalid-password]]');
-			}
-
-			await user.email.sendValidationEmail(userData.uid, {
-				email: formData.email,
-				force: true,
-			}).catch((err) => {
-				winston.error(`[user.interstitials.email] Validation email failed to send\n[emailer.send] ${err.stack}`);
-			});
-			if (isSelf) {
-				data.req.session.emailChanged = 1;
-			}
+			await sendValidationEmail(userData, formData, hasPassword, isPasswordCorrect, isSelf, req);
 		} else {
 			throw new Error('[[error:no-privileges]]');
 		}
@@ -67,78 +82,9 @@ async function validateAndSendEmail(userData, formData, data, hasPassword, isSel
 		}
 
 		if (current.length && (!hasPassword || (hasPassword && isPasswordCorrect))) {
-			await user.email.remove(userData.uid, isSelf ? data.req.session.id : null);
+			await user.email.remove(userData.uid, isSelf ? req.session.id : null);
 		}
 	}
-}
-
-// Helper function to check GDPR consent
-async function checkGdprConsent(data) {
-	if (!meta.config.gdpr_enabled || (data.userData && data.userData.gdpr_consent)) {
-		return data;
-	}
-	if (!data.userData) {
-		throw new Error('[[error:invalid-data]]');
-	}
-
-	if (data.userData.uid) {
-		const consented = await db.getObjectField(`user:${data.userData.uid}`, 'gdpr_consent');
-		if (parseInt(consented, 10)) {
-			return data;
-		}
-	}
-
-	data.interstitials.push({
-		template: 'partials/gdpr_consent',
-		data: {
-			digestFrequency: meta.config.dailyDigestFreq,
-			digestEnabled: meta.config.dailyDigestFreq !== 'off',
-		},
-		callback: (userData, formData, next) => {
-			if (formData.gdpr_agree_data === 'on' && formData.gdpr_agree_email === 'on') {
-				userData.gdpr_consent = true;
-			}
-			next(userData.gdpr_consent ? null : new Error('[[register:gdpr-consent-denied]]'));
-		},
-	});
-	return data;
-}
-
-// Helper function to check Terms of Use acceptance
-async function checkTermsOfUse(data) {
-	if (!data.userData) {
-		throw new Error('[[error:invalid-data]]');
-	}
-	if (!meta.config.termsOfUse || data.userData.acceptTos) {
-		return data;
-	}
-
-	if (data.userData.uid) {
-		const accepted = await db.getObjectField(`user:${data.userData.uid}`, 'acceptTos');
-		if (parseInt(accepted, 10)) {
-			return data;
-		}
-	}
-
-	const termsOfUse = await plugins.hooks.fire('filter:parse.post', {
-		postData: {
-			content: meta.config.termsOfUse || '',
-		},
-	});
-
-	data.interstitials.push({
-		template: 'partials/acceptTos',
-		data: {
-			termsOfUse: termsOfUse.postData.content,
-		},
-		callback: (userData, formData, next) => {
-			if (formData['agree-terms'] === 'on') {
-				userData.acceptTos = true;
-			}
-			next(userData.acceptTos ? null : new Error('[[register:terms-of-use-error]]'));
-		},
-	});
-	return data;
 }
 
 Interstitials.get = async (req, userData) => plugins.hooks.fire('filter:register.interstitial', {
@@ -180,7 +126,7 @@ Interstitials.email = async (data) => {
 
 			if (userData.uid) {
 				const isSelf = parseInt(userData.uid, 10) === parseInt(data.req.uid, 10);
-				await validateAndSendEmail(userData, formData, data, hasPassword, isSelf);
+				await validateAndSendEmail(userData, formData, data.req, hasPassword, isSelf);
 			} else {
 				const { allowed, error } = await plugins.hooks.fire('filter:user.saveEmail', {
 					uid: null,
@@ -204,6 +150,69 @@ Interstitials.email = async (data) => {
 	return data;
 };
 
-Interstitials.gdpr = checkGdprConsent;
+Interstitials.gdpr = async (data) => {
+	if (!meta.config.gdpr_enabled || (data.userData && data.userData.gdpr_consent)) {
+		return data;
+	}
+	if (!data.userData) {
+		throw new Error('[[error:invalid-data]]');
+	}
 
-Interstitials.tou = checkTermsOfUse;
+	if (data.userData.uid) {
+		const consented = await db.getObjectField(`user:${data.userData.uid}`, 'gdpr_consent');
+		if (parseInt(consented, 10)) {
+			return data;
+		}
+	}
+
+	data.interstitials.push({
+		template: 'partials/gdpr_consent',
+		data: {
+			digestFrequency: meta.config.dailyDigestFreq,
+			digestEnabled: meta.config.dailyDigestFreq !== 'off',
+		},
+		callback: (userData, formData, next) => {
+			if (formData.gdpr_agree_data === 'on' && formData.gdpr_agree_email === 'on') {
+				userData.gdpr_consent = true;
+			}
+			next(userData.gdpr_consent ? null : new Error('[[register:gdpr-consent-denied]]'));
+		},
+	});
+	return data;
+};
+
+Interstitials.tou = async (data) => {
+	if (!data.userData) {
+		throw new Error('[[error:invalid-data]]');
+	}
+	if (!meta.config.termsOfUse || data.userData.acceptTos) {
+		return data;
+	}
+
+	if (data.userData.uid) {
+		const accepted = await db.getObjectField(`user:${data.userData.uid}`, 'acceptTos');
+		if (parseInt(accepted, 10)) {
+			return data;
+		}
+	}
+
+	const termsOfUse = await plugins.hooks.fire('filter:parse.post', {
+		postData: {
+			content: meta.config.termsOfUse || '',
+		},
+	});
+
+	data.interstitials.push({
+		template: 'partials/acceptTos',
+		data: {
+			termsOfUse: termsOfUse.postData.content,
+		},
+		callback: (userData, formData, next) => {
+			if (formData['agree-terms'] === 'on') {
+				userData.acceptTos = true;
+			}
+			next(userData.acceptTos ? null : new Error('[[register:terms-of-use-error]]'));
+		},
+	});
+	return data;
+};
