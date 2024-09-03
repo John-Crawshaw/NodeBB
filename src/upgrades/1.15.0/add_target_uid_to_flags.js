@@ -16,17 +16,7 @@ module.exports = {
 			for (const flagObj of flagData) {
 				/* eslint-disable no-await-in-loop */
 				if (flagObj) {
-					const { targetId } = flagObj;
-					if (targetId) {
-						if (flagObj.type === 'post') {
-							const targetUid = await posts.getPostField(targetId, 'uid');
-							if (targetUid) {
-								await db.setObjectField(`flag:${flagObj.flagId}`, 'targetUid', targetUid);
-							}
-						} else if (flagObj.type === 'user') {
-							await db.setObjectField(`flag:${flagObj.flagId}`, 'targetUid', targetId);
-						}
-					}
+					handleFlagObj(flagObj);
 				}
 			}
 		}, {
@@ -35,3 +25,17 @@ module.exports = {
 		});
 	},
 };
+
+async function handleFlagObj(flagObj) {
+	const { targetId } = flagObj;
+	if (targetId) {
+		if (flagObj.type === 'post') {
+			const targetUid = await posts.getPostField(targetId, 'uid');
+			if (targetUid) {
+				await db.setObjectField(`flag:${flagObj.flagId}`, 'targetUid', targetUid);
+			}
+		} else if (flagObj.type === 'user') {
+			await db.setObjectField(`flag:${flagObj.flagId}`, 'targetUid', targetId);
+		}
+	}
+}
