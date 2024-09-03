@@ -4,7 +4,7 @@ const winston = require('winston');
 const util = require('util');
 
 const user = require('.');
-const db = require('../database'); // Re-added the db module
+const db = require('../database');
 const meta = require('../meta');
 const privileges = require('../privileges');
 const plugins = require('../plugins');
@@ -60,7 +60,7 @@ async function validateAndSendEmail(userData, formData, req, hasPassword, isSelf
 			uid: userData.uid,
 			email: formData.email,
 			registration: false,
-			allowed: true, // change this value to disallow
+			allowed: true,
 			error: '[[error:invalid-email]]',
 		}),
 	]);
@@ -77,13 +77,18 @@ async function validateAndSendEmail(userData, formData, req, hasPassword, isSelf
 			throw new Error('[[error:no-privileges]]');
 		}
 	} else {
-		if (meta.config.requireEmailAddress) {
-			throw new Error('[[error:invalid-email]]');
-		}
+		await handleEmptyEmail(userData, formData, hasPassword, isPasswordCorrect, current, isSelf, req);
+	}
+}
 
-		if (current.length && (!hasPassword || (hasPassword && isPasswordCorrect))) {
-			await user.email.remove(userData.uid, isSelf ? req.session.id : null);
-		}
+// Helper function to handle empty email case
+async function handleEmptyEmail(userData, formData, hasPassword, isPasswordCorrect, current, isSelf, req) {
+	if (meta.config.requireEmailAddress) {
+		throw new Error('[[error:invalid-email]]');
+	}
+
+	if (current.length && (!hasPassword || (hasPassword && isPasswordCorrect))) {
+		await user.email.remove(userData.uid, isSelf ? req.session.id : null);
 	}
 }
 
@@ -128,19 +133,7 @@ Interstitials.email = async (data) => {
 				const isSelf = parseInt(userData.uid, 10) === parseInt(data.req.uid, 10);
 				await validateAndSendEmail(userData, formData, data.req, hasPassword, isSelf);
 			} else {
-				const { allowed, error } = await plugins.hooks.fire('filter:user.saveEmail', {
-					uid: null,
-					email: formData.email,
-					registration: true,
-					allowed: true, // change this value to disallow
-					error: '[[error:invalid-email]]',
-				});
-
-				if (!allowed || (meta.config.requireEmailAddress && !(formData.email && formData.email.length))) {
-					throw new Error(error);
-				}
-
-				userData.email = formData.email;
+				await handleNewUserEmail(userData, formData);
 			}
 
 			delete userData.updateEmail;
@@ -149,6 +142,23 @@ Interstitials.email = async (data) => {
 
 	return data;
 };
+
+// Helper function for new user email handling
+async function handleNewUserEmail(userData, formData) {
+	const { allowed, error } = await plugins.hooks.fire('filter:user.saveEmail', {
+		uid: null,
+		email: formData.email,
+		registration: true,
+		allowed: true,
+		error: '[[error:invalid-email]]',
+	});
+
+	if (!allowed || (meta.config.requireEmailAddress && !(formData.email && formData.email.length))) {
+		throw new Error(error);
+	}
+
+	userData.email = formData.email;
+}
 
 Interstitials.gdpr = async (data) => {
 	if (!meta.config.gdpr_enabled || (data.userData && data.userData.gdpr_consent)) {
